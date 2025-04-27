@@ -1,194 +1,129 @@
-# bot.py
-
 import logging
-import time
-import aiosqlite
-from telegram import Update, Message
+import sqlite3
+from telegram import Update, MessageOriginType
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    ContextTypes,
     filters,
-    ContextTypes
 )
-from config import API_TOKEN, REGISTRATION_CHAT_ID
+import config
 
-DB_PATH = "bot.db"
-
-# ——— Initialize logging ———
+# Configure logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ——— Database setup ———
-async def init_db():
-    """Create tables for channels and broadcasts if they don't exist."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS channels (
-                channel_id INTEGER PRIMARY KEY
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS broadcasts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                batch_id TEXT,
-                private_chat_id INTEGER,
-                private_message_id INTEGER,
-                channel_id INTEGER,
-                channel_message_id INTEGER
-            )
-        """)
-        await db.commit()
+# Initialize SQLite database
+conn = sqlite3.connect('bot.db')
+cursor = conn.cursor()
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS broadcasts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        original_message_id INTEGER,
+        broadcast_message_ids TEXT
+    )
+''')
+conn.commit()
 
-# ——— Handlers ———
+async def register_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
 
-async def register_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Auto-register a channel when you forward one of its messages
-    into the registration channel.
-    """
-    msg: Message = update.effective_message
-    if msg.chat.id != REGISTRATION_CHAT_ID:
+    # Check if the message is forwarded
+    if message.forward_origin and message.forward_origin.type == MessageOriginType.CHANNEL:
+        original_channel_id = message.forward_origin.chat.id
+        logger.info(f"Registered channel ID: {original_channel_id}")
+        await message.reply_text(f"Channel ID {original_channel_id} registered.")
+    else:
+        logger.warning("Forwarded message lacks origin information.")
+        await message.reply_text("Unable to register channel: no origin information found.")
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+
+    if not message.reply_to_message:
+        await message.reply_text("Please reply to the message you want to broadcast.")
         return
-    src = msg.forward_from_chat
-    if not src:
-        return  # ignore non-channel forwards
-    cid = src.id
-    async with aiosqlite.connect(DB_PATH) as db:
+
+    original_message = message.reply_to_message
+    broadcast_message_ids = []
+
+    for channel_id in config.BROADCAST_CHANNEL_IDS:
         try:
-            await db.execute(
-                "INSERT OR IGNORE INTO channels (channel_id) VALUES (?)",
-                (cid,)
+            sent_message = await context.bot.copy_message(
+                chat_id=channel_id,
+                from_chat_id=original_message.chat.id,
+                message_id=original_message.message_id
             )
-            await db.commit()
-            await msg.reply_text(f"✅ Registered channel `{cid}`")
+            broadcast_message_ids.append(str(sent_message.message_id))
         except Exception as e:
-            logger.error(f"Error registering {cid}: {e}")
+            logger.error(f"Failed to broadcast to {channel_id}: {e}")
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/start — show bot status and how many channels are registered."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM channels") as cur:
-            total = (await cur.fetchone())[0]
-    await update.message.reply_text(
-        f"🤖 Bot is online.\n📡 Registered channels: {total}"
+    # Store the broadcast information in the database
+    cursor.execute(
+        'INSERT INTO broadcasts (original_message_id, broadcast_message_ids) VALUES (?, ?)',
+        (original_message.message_id, ','.join(broadcast_message_ids))
     )
+    conn.commit()
 
-async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /broadcast — reply to your own private message to send it to all channels.
-    Records each copy so it can later be deleted en masse.
-    """
-    if not update.message.reply_to_message:
-        return await update.message.reply_text("❌ Please reply to a message to broadcast.")
-    orig: Message = update.message.reply_to_message
-    batch_id = str(int(time.time()))
-    successes = failures = 0
+    await message.reply_text("Broadcast completed.")
 
-    # Fetch registered channels
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT channel_id FROM channels") as cur:
-            channels = [row[0] for row in await cur.fetchall()]
+async def delete_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
 
-        # Copy message into each channel & record mapping
-        for ch in channels:
-            try:
-                sent = await context.bot.copy_message(
-                    chat_id=ch,
-                    from_chat_id=orig.chat.id,
-                    message_id=orig.message_id
-                )
-                await db.execute(
-                    """INSERT INTO broadcasts
-                       (batch_id, private_chat_id, private_message_id, channel_id, channel_message_id)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (batch_id, update.effective_chat.id, orig.message_id, ch, sent.message_id)
-                )
-                successes += 1
-            except Exception as e:
-                logger.warning(f"Broadcast to {ch} failed: {e}")
-                failures += 1
-        await db.commit()
+    if not message.reply_to_message:
+        await message.reply_text("Please reply to the broadcasted message you want to delete.")
+        return
 
-    await update.message.reply_text(
-        f"📤 Broadcast done!\n"
-        f"✅ Success: {successes}\n"
-        f"❌ Failed:  {failures}\n"
-        f"📋 Total channels: {len(channels)}"
+    original_message_id = message.reply_to_message.message_id
+
+    # Retrieve the broadcast message IDs from the database
+    cursor.execute(
+        'SELECT broadcast_message_ids FROM broadcasts WHERE original_message_id = ?',
+        (original_message_id,)
     )
+    result = cursor.fetchone()
 
-async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /delete — reply to your original broadcast message in private chat.
-    Deletes that batch from all channels where it was posted.
-    """
-    if not update.message.reply_to_message:
-        return await update.message.reply_text("❌ Reply to your broadcast message to delete.")
-    orig_mid = update.message.reply_to_message.message_id
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Identify batch via private message mapping
-        async with db.execute(
-            """SELECT batch_id FROM broadcasts
-               WHERE private_chat_id = ? AND private_message_id = ?""",
-            (update.effective_chat.id, orig_mid)
-        ) as cur:
-            row = await cur.fetchone()
-        if not row:
-            return await update.message.reply_text("❌ No record found for that broadcast.")
+    if not result:
+        await message.reply_text("No broadcast record found for this message.")
+        return
 
-        batch_id = row[0]
-        async with db.execute(
-            "SELECT channel_id, channel_message_id FROM broadcasts WHERE batch_id = ?",
-            (batch_id,)
-        ) as cur:
-            entries = await cur.fetchall()
+    broadcast_message_ids = result[0].split(',')
 
-        deleted = not_found = 0
-        for ch, msg_id in entries:
-            try:
-                await context.bot.delete_message(chat_id=ch, message_id=msg_id)
-                deleted += 1
-            except Exception:
-                not_found += 1
+    for channel_id, msg_id in zip(config.BROADCAST_CHANNEL_IDS, broadcast_message_ids):
+        try:
+            await context.bot.delete_message(chat_id=channel_id, message_id=int(msg_id))
+        except Exception as e:
+            logger.error(f"Failed to delete message {msg_id} in channel {channel_id}: {e}")
 
-    await update.message.reply_text(
-        f"🗑 Delete complete.\n"
-        f"✅ Deleted:     {deleted}\n"
-        f"❓ Not found:   {not_found}\n"
-        f"📋 Total in batch: {len(entries)}"
+    # Optionally, remove the record from the database
+    cursor.execute(
+        'DELETE FROM broadcasts WHERE original_message_id = ?',
+        (original_message_id,)
     )
+    conn.commit()
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Log all exceptions and notify the admin."""
-    logger.error("Exception while handling update:", exc_info=context.error)
+    await message.reply_text("Broadcast messages deleted.")
 
 def main():
-    # Initialize DB & bot
-    import asyncio
-    asyncio.run(init_db())
-    app = Application.builder().token(API_TOKEN).build()
+    application = ApplicationBuilder().token(config.BOT_TOKEN).build()
 
-    # Forward-watcher for dynamic registration
-    app.add_handler(
-        MessageHandler(
-            filters.Chat(chat_id=REGISTRATION_CHAT_ID) & filters.FORWARDED,
-            register_forward
-        )
-    )
+    # Handler to register channels via forwarded messages
+    application.add_handler(MessageHandler(
+        filters.Chat(config.REGISTRATION_CHANNEL_ID) & filters.FORWARDED,
+        register_channel
+    ))
 
-    # Command handlers
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    app.add_handler(CommandHandler("delete", delete_cmd))
+    # Handler for /broadcast command
+    application.add_handler(CommandHandler("broadcast", broadcast))
 
-    # Global error handler
-    app.add_error_handler(error_handler)
+    # Handler for /delete command
+    application.add_handler(CommandHandler("delete", delete_broadcast))
 
-    # Start polling
-    app.run_polling()
+    application.run_polling()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
