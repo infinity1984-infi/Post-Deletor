@@ -1,8 +1,7 @@
 # config.py
 
-# Your BotFather token
+# Your BotFather API token
 API_TOKEN = "123456789:ABCdefGhIjKlmNoPQRsTuvWX"
 
-# The ID of your special "batch" or "registration" channel
-# (where you'll forward posts so the bot can learn the origin chat IDs)
+# ID of your special "registration" channel for forwarding
 REGISTRATION_CHAT_ID = -1001234567890
